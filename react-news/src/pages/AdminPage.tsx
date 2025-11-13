@@ -14,6 +14,11 @@ const generateFilePath = (file: File) => {
   return `${randomPart}-${safeName}`
 }
 
+const extractStoragePath = (url: string) => {
+  const [, path] = url.split('/news-pictures/')
+  return path ? decodeURIComponent(path) : null
+}
+
 const parseTags = (input: string) => {
   const raw = input
     .split(',')
@@ -35,6 +40,19 @@ type NewsSummary = {
   id: string
   title: string
   created_at: string
+}
+
+type NewsDetail = {
+  id: string
+  title: string
+  text: string
+  tags: { name: string }[] | null
+  pictures: { url: string }[] | null
+}
+
+type ExistingPicture = {
+  url: string
+  markedForRemoval?: boolean
 }
 
 type ToastState = {
@@ -60,10 +78,15 @@ export function AdminPage() {
   const [isDeleting, setIsDeleting] = useState(false)
   const [toast, setToast] = useState<ToastState | null>(null)
 
+  const [editingNews, setEditingNews] = useState<NewsDetail | null>(null)
+  const [existingPictures, setExistingPictures] = useState<ExistingPicture[]>([])
+  const [isLoadingSelection, setIsLoadingSelection] = useState(false)
+
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const toastTimeoutRef = useRef<number | null>(null)
 
   const parsedTags = useMemo(() => parseTags(tagsInput), [tagsInput])
+  const isEditing = Boolean(editingNews)
 
   const ensureBucketExists = useCallback(async () => {
     try {
@@ -153,6 +176,8 @@ export function AdminPage() {
     setTagsInput('')
     setPictures([])
     setValidationError(null)
+    setEditingNews(null)
+    setExistingPictures([])
     if (fileInputRef.current) {
       fileInputRef.current.value = ''
     }
@@ -165,6 +190,122 @@ export function AdminPage() {
     }
     toastTimeoutRef.current = window.setTimeout(() => setToast(null), 4000)
   }
+
+  const syncTags = useCallback(
+    async (newsId: string) => {
+      const { error: clearError } = await supabase.from('news_tags').delete().eq('news_id', newsId)
+      if (clearError) {
+        throw new Error(`Failed to clear existing tags: ${clearError.message}`)
+      }
+
+      if (parsedTags.length === 0) {
+        return
+      }
+
+      const tagPayload = parsedTags.map((name) => ({ name }))
+      const { error: upsertError } = await supabase.from('tags').upsert(tagPayload, { onConflict: 'name' })
+
+      if (upsertError) {
+        throw new Error(`Failed to upsert tags: ${upsertError.message}`)
+      }
+
+      const { data: tagsData, error: selectTagsError } = await supabase
+        .from('tags')
+        .select('id, name')
+        .in('name', parsedTags)
+
+      if (selectTagsError) {
+        throw new Error(`Failed to fetch tags: ${selectTagsError.message}`)
+      }
+
+      if (tagsData && tagsData.length > 0) {
+        const newsTags = tagsData.map((tag) => ({ news_id: newsId, tag_id: tag.id }))
+        const { error: newsTagsError } = await supabase.from('news_tags').insert(newsTags)
+
+        if (newsTagsError) {
+          throw new Error(`Failed to link tags: ${newsTagsError.message}`)
+        }
+      }
+    },
+    [parsedTags],
+  )
+
+  const syncPictures = useCallback(
+    async (newsId: string) => {
+      const picturesToDelete = existingPictures.filter((picture) => picture.markedForRemoval)
+      if (picturesToDelete.length > 0) {
+        const paths = picturesToDelete
+          .map((picture) => extractStoragePath(picture.url))
+          .filter((path): path is string => Boolean(path))
+        if (paths.length > 0) {
+          const { error: storageError } = await supabase.storage.from('news-pictures').remove(paths)
+          if (storageError) {
+            throw new Error(`Failed to remove existing pictures from storage: ${storageError.message}`)
+          }
+        }
+
+        const { error: deleteError } = await supabase
+          .from('pictures')
+          .delete()
+          .eq('news_id', newsId)
+          .in(
+            'url',
+            picturesToDelete.map((picture) => picture.url),
+          )
+
+        if (deleteError) {
+          throw new Error(`Failed to remove picture records: ${deleteError.message}`)
+        }
+      }
+
+      const uploadedPictures: { path: string; publicUrl: string }[] = []
+
+      if (pictures.length > 0) {
+        for (const file of pictures) {
+          const path = generateFilePath(file)
+          const { error: uploadError } = await supabase.storage
+            .from('news-pictures')
+            .upload(path, file, { cacheControl: '3600', upsert: false })
+
+          if (uploadError) {
+            throw new Error(`Failed to upload ${file.name}: ${uploadError.message}`)
+          }
+
+          const { data: publicData } = supabase.storage.from('news-pictures').getPublicUrl(path)
+          if (!publicData?.publicUrl) {
+            throw new Error(`Unable to obtain public URL for ${file.name}.`)
+          }
+
+          uploadedPictures.push({ path, publicUrl: publicData.publicUrl })
+        }
+
+        const pictureRows = uploadedPictures.map((picture) => ({
+          news_id: newsId,
+          url: picture.publicUrl,
+        }))
+
+        const { error: picturesError } = await supabase.from('pictures').insert(pictureRows)
+
+        if (picturesError) {
+          throw new Error(`Failed to save picture metadata: ${picturesError.message}`)
+        }
+      }
+
+      if (picturesToDelete.length > 0 || pictures.length > 0) {
+        const { data: refreshedPictures, error: refreshError } = await supabase
+          .from('pictures')
+          .select('url')
+          .eq('news_id', newsId)
+
+        if (refreshError) {
+          throw new Error(`Failed to refresh picture list: ${refreshError.message}`)
+        }
+
+        setExistingPictures((refreshedPictures ?? []).map((picture) => ({ url: picture.url })))
+      }
+    },
+    [existingPictures, pictures],
+  )
 
   const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
@@ -186,85 +327,45 @@ export function AdminPage() {
     setStatus(null)
 
     try {
-      const uploadedPictures: { path: string; publicUrl: string }[] = []
+      if (isEditing && editingNews) {
+        const { data: updated, error: updateError } = await supabase
+          .from('news')
+          .update({ title: trimmedTitle, text: trimmedText })
+          .eq('id', editingNews.id)
+          .select('id, created_at, title')
+          .single()
 
-      if (pictures.length > 0) {
-        for (const file of pictures) {
-          const path = generateFilePath(file)
-          const { error: uploadError } = await supabase.storage
-            .from('news-pictures')
-            .upload(path, file, { cacheControl: '3600', upsert: false })
-
-          if (uploadError) {
-            throw new Error(`Failed to upload ${file.name}: ${uploadError.message}`)
-          }
-
-          const { data: publicData } = supabase.storage.from('news-pictures').getPublicUrl(path)
-          if (!publicData?.publicUrl) {
-            throw new Error(`Unable to obtain public URL for ${file.name}.`)
-          }
-
-          uploadedPictures.push({ path, publicUrl: publicData.publicUrl })
+        if (updateError || !updated?.id) {
+          throw new Error(updateError?.message ?? 'Failed to update news article.')
         }
+
+        await syncTags(editingNews.id)
+        await syncPictures(editingNews.id)
+
+        setStatus({ type: 'success', message: 'News article updated successfully!' })
+        setNewsList((prev) => prev.map((item) => (item.id === updated.id ? updated : item)))
+        resetForm()
+        await loadNews()
+      } else {
+        const { data: newsData, error: newsError } = await supabase
+          .from('news')
+          .insert({ title: trimmedTitle, text: trimmedText })
+          .select('id, created_at, title')
+          .single()
+
+        if (newsError || !newsData?.id) {
+          throw new Error(newsError?.message ?? 'Failed to create news article.')
+        }
+
+        const newsId = newsData.id
+
+        await syncTags(newsId)
+        await syncPictures(newsId)
+
+        setStatus({ type: 'success', message: 'News article created successfully!' })
+        resetForm()
+        setNewsList((prev) => [newsData, ...prev])
       }
-
-      const { data: newsData, error: newsError } = await supabase
-        .from('news')
-        .insert({ title: trimmedTitle, text: trimmedText })
-        .select('id, created_at, title')
-        .single()
-
-      if (newsError || !newsData?.id) {
-        throw new Error(newsError?.message ?? 'Failed to create news article.')
-      }
-
-      const newsId = newsData.id
-
-      if (parsedTags.length > 0) {
-        const tagPayload = parsedTags.map((name) => ({ name }))
-        const { error: upsertError } = await supabase
-          .from('tags')
-          .upsert(tagPayload, { onConflict: 'name' })
-
-        if (upsertError) {
-          throw new Error(`Failed to upsert tags: ${upsertError.message}`)
-        }
-
-        const { data: tagsData, error: selectTagsError } = await supabase
-          .from('tags')
-          .select('id, name')
-          .in('name', parsedTags)
-
-        if (selectTagsError) {
-          throw new Error(`Failed to fetch tags: ${selectTagsError.message}`)
-        }
-
-        if (tagsData && tagsData.length > 0) {
-          const newsTags = tagsData.map((tag) => ({ news_id: newsId, tag_id: tag.id }))
-          const { error: newsTagsError } = await supabase.from('news_tags').insert(newsTags)
-
-          if (newsTagsError) {
-            throw new Error(`Failed to link tags: ${newsTagsError.message}`)
-          }
-        }
-      }
-
-      if (uploadedPictures.length > 0) {
-        const pictureRows = uploadedPictures.map((picture) => ({
-          news_id: newsId,
-          url: picture.publicUrl,
-        }))
-
-        const { error: picturesError } = await supabase.from('pictures').insert(pictureRows)
-
-        if (picturesError) {
-          throw new Error(`Failed to save picture metadata: ${picturesError.message}`)
-        }
-      }
-
-      setStatus({ type: 'success', message: 'News article created successfully!' })
-      resetForm()
-      setNewsList((prev) => [newsData, ...prev])
     } catch (error) {
       console.error(error)
       const message = error instanceof Error ? error.message : 'Unexpected error while creating news article.'
@@ -273,6 +374,50 @@ export function AdminPage() {
       setIsSubmitting(false)
     }
   }
+
+  const handleSelectNews = useCallback(
+    async (newsId: string) => {
+      setIsLoadingSelection(true)
+      setStatus(null)
+      setValidationError(null)
+      try {
+        const { data, error } = await supabase
+          .from('news')
+          .select('id, title, text, tags(name), pictures(url)')
+          .eq('id', newsId)
+          .single()
+
+        if (error || !data) {
+          throw new Error(error?.message ?? 'Failed to load news details.')
+        }
+
+        const detail: NewsDetail = {
+          id: data.id,
+          title: data.title,
+          text: data.text,
+          tags: data.tags,
+          pictures: data.pictures,
+        }
+
+        setEditingNews(detail)
+        setTitle(detail.title)
+        setText(detail.text)
+        setTagsInput(detail.tags?.map((tag) => tag.name).join(', ') ?? '')
+        setExistingPictures(detail.pictures?.map((picture) => ({ url: picture.url })) ?? [])
+        setPictures([])
+        if (fileInputRef.current) {
+          fileInputRef.current.value = ''
+        }
+      } catch (error) {
+        console.error(error)
+        const message = error instanceof Error ? error.message : 'Unexpected error while loading news details.'
+        setStatus({ type: 'error', message })
+      } finally {
+        setIsLoadingSelection(false)
+      }
+    },
+    [setStatus],
+  )
 
   const confirmDelete = async () => {
     if (!deleteTarget) {
@@ -331,6 +476,11 @@ export function AdminPage() {
 
       <div className="row g-5">
         <div className="col-12 col-lg-6">
+          {isEditing && editingNews ? (
+            <div className="alert alert-info" role="status">
+              Editing “{editingNews.title}”. Submit to save changes or reset to create a new article.
+            </div>
+          ) : null}
           <form className="row gy-4" onSubmit={handleSubmit}>
             <div className="col-12">
               <label htmlFor="admin-title" className="form-label">
@@ -416,11 +566,43 @@ export function AdminPage() {
                   ))}
                 </ul>
               ) : null}
+              {existingPictures.length > 0 ? (
+                <div className="mt-3">
+                  <div className="form-label">Current pictures</div>
+                  <ul className="list-group list-group-flush">
+                    {existingPictures.map((picture, index) => (
+                      <li className="list-group-item d-flex align-items-center justify-content-between px-0 py-1" key={picture.url}>
+                        <span className="small text-truncate" style={{ maxWidth: '70%' }}>
+                          #{index + 1} {picture.url.split('/').slice(-1)[0]}
+                        </span>
+                        <div className="form-check form-switch">
+                          <input
+                            id={`remove-picture-${index}`}
+                            type="checkbox"
+                            className="form-check-input"
+                            checked={Boolean(picture.markedForRemoval)}
+                            onChange={() =>
+                              setExistingPictures((prev) =>
+                                prev.map((item) =>
+                                  item.url === picture.url ? { ...item, markedForRemoval: !item.markedForRemoval } : item,
+                                ),
+                              )
+                            }
+                          />
+                          <label className="form-check-label small" htmlFor={`remove-picture-${index}`}>
+                            Remove
+                          </label>
+                        </div>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
             </div>
 
             <div className="col-12 d-flex gap-3">
               <button type="submit" className="btn btn-primary" disabled={isSubmitting}>
-                {isSubmitting ? 'Saving…' : 'Publish News'}
+                {isSubmitting ? 'Saving…' : isEditing ? 'Update News' : 'Publish News'}
               </button>
               <button
                 type="button"
@@ -431,7 +613,7 @@ export function AdminPage() {
                 }}
                 disabled={isSubmitting}
               >
-                Reset
+                {isEditing ? 'Cancel editing' : 'Reset'}
               </button>
             </div>
           </form>
@@ -459,20 +641,35 @@ export function AdminPage() {
               <div className="list-group-item text-muted">No news articles yet.</div>
             ) : null}
             {newsList.map((item) => (
-              <div className="list-group-item d-flex justify-content-between align-items-center" key={item.id}>
+              <div
+                className={`list-group-item d-flex justify-content-between align-items-center ${
+                  editingNews?.id === item.id ? 'border-primary-subtle border-2' : ''
+                }`}
+                key={item.id}
+              >
                 <div>
                   <h3 className="h6 mb-1">{item.title}</h3>
                   <p className="mb-0 text-body-secondary small">
                     {dayjs(item.created_at).format('MMM D, YYYY h:mm A')}
                   </p>
                 </div>
-                <button
-                  type="button"
-                  className="btn btn-outline-danger btn-sm"
-                  onClick={() => setDeleteTarget(item)}
-                >
-                  Delete
-                </button>
+                <div className="btn-group">
+                  <button
+                    type="button"
+                    className="btn btn-outline-primary btn-sm"
+                    onClick={() => void handleSelectNews(item.id)}
+                    disabled={isLoadingSelection}
+                  >
+                    {isLoadingSelection && editingNews?.id !== item.id ? 'Loading…' : 'Edit'}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-outline-danger btn-sm"
+                    onClick={() => setDeleteTarget(item)}
+                  >
+                    Delete
+                  </button>
+                </div>
               </div>
             ))}
           </div>
